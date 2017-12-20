@@ -1,4 +1,4 @@
-
+import asyncio
 import configparser as cp
 import datetime as dt
 import h5py
@@ -10,14 +10,12 @@ import time
 
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine
-from sqlalchemy.types import INTEGER,FLOAT
 
 from StocksMinDB.Constants import LogMark,TableCol
 
 class StocksMinDB:
 
-    def __init__(self,configpath):
+    def __init__(self,configpath,cornum=1):
         cfp = cp.ConfigParser()
         cfp.read(os.path.join(configpath,'loginfo.ini'))
         self._loginfo = dict(cfp.items('login'))
@@ -25,6 +23,7 @@ class StocksMinDB:
         cfp.read(os.path.join(configpath,'datainfo.ini'))
         self._updtpath = cfp.get('datasource','update')
         self._histpath = cfp.get('datasource','history')
+        self._tmpupdt = cfp.get('other','updtfld')
         ######## create logger # 按实际调用日期写日志  ########
         logfile = os.path.join('logs','Stocks_Data_Min_{0}.log'.format(dt.datetime.today().strftime('%Y%m%d')))
         if not os.path.exists(logfile):
@@ -40,10 +39,14 @@ class StocksMinDB:
         ch.setFormatter(formatter)
         self._logger.addHandler(fh)
         self._logger.addHandler(ch)
+        ######### corutine数量 ######
+        self._corutine_num = cornum
 
     def _db_connect(self,dbtype='by_day'):
         """ 连接到数据库"""
-        dbname  = '_'.join(['stocks_data_min',dbtype])
+        #dbname  = '_'.join(['stocks_data_min',dbtype])
+        if dbtype=='by_stock':
+            dbname = 'testdb'
         if (self._currdb is not None) and (self._currdb==dbtype):
             self._logger.info('{0}already connected to database : {1}'.format(LogMark.info,self._currdb))
         elif (self._currdb is not None) and (self._currdb!=dbtype):
@@ -56,11 +59,6 @@ class StocksMinDB:
                 self.cursor.execute('SELECT DATABASE()')
                 self._currdb = self.cursor.fetchone()[0]
                 self._logger.info('{0}connected to database : {1}'.format(LogMark.info,self._currdb))
-                # egnstr = r'mysql+mysqlconnector://root:{pwd}@{host}/{schema}?charset=utf8'.format(pwd=self._loginfo['password'],
-                #                                                                                  host=self._loginfo['host'],
-                #                                                                                  #port=self._loginfo['port'],
-                #                                                                                  schema=dbname)
-                # self._engine = create_engine(egnstr, echo=False)
             except mysql.connector.Error as e:
                 self._logger.error('{0}connect fails : {1}'.format(LogMark.error,str(e)))
 
@@ -76,11 +74,6 @@ class StocksMinDB:
                 self.cursor.execute('SELECT DATABASE()')
                 self._currdb = self.cursor.fetchone()[0]
                 self._logger.info('{0}connected to database : {1}'.format(LogMark.info,self._currdb))
-                # egnstr = r'mysql+mysqlconnector://root:{pwd}@{host}/{schema}?charset=utf8'.format(pwd=self._loginfo['password'],
-                #                                                                              host=self._loginfo['host'],
-                #                                                                              #port=self._loginfo['port'],
-                #                                                                              schema=dbname)
-                # self._engine = create_engine(egnstr, echo=False)
             except mysql.connector.Error as e:
                 self._logger.error('{0}connect fails : {1}'.format(LogMark.error,str(e)))
 
@@ -146,14 +139,15 @@ class StocksMinDB:
                     rowdata = data[row,:]
                     exeline = ''.join([insertline,'('+','.join(['{'+'{0}'.format(i)+'}' for i in range(colnum)])+')']).format(*rowdata)
                     self.cursor.execute(exeline)
-                self.conn.commit()
-                self._logger.info('{0}table updated {1} successfully in database {2} with {3} seconds'.format(LogMark.info,tablename,self._currdb,time.time()-st))
-            except mysql.connector.Error as e:
+            except BaseException as e:
                 if (hastable and if_exist=='replace') or (not hastable): # 需要创建新表格的情况下
                     self.cursor.execute('DROP TABLE {0}'.format(tablename))  # 如果更新失败需要确保表格删除
                     self._logger.info('{0}table {1} dropped from database {2}'.format(LogMark.info,tablename,self._currdb))
                 self._logger.error('{0}update table {1} failed in database {2}, line No.{3} ,err : {4}'.format(LogMark.error,tablename,self._currdb,row,str(e)))
                 raise e
+            else:
+                self.conn.commit()
+                self._logger.info('{0}table updated {1} successfully in database {2} with {3} seconds'.format(LogMark.info,tablename,self._currdb,time.time()-st))
 
     def update_data_by_day(self):
         """ 按日度更新数据，目前为.mat格式 """
@@ -186,71 +180,19 @@ class StocksMinDB:
             self.cursor.execute(dateupdt)
             self.conn.commit()
 
-    def update_data_by_day1(self):
-        """ 按日度更新数据，目前为.mat格式 """
-        datelst = [date.split('.')[0] for date in os.listdir(self._updtpath)]
-        newdates = sorted(set(datelst) - set([tb.split('_')[1] for tb in self._get_db_tables()]))
-        if not newdates:
-            self._logger.info('{0}no new table to update for database {1}'.format(LogMark.info,self._currdb))
-            return
-        else:
-            self._logger.info('{0}{1} tables to update for database {2}'.format(LogMark.info,len(newdates),self._currdb))
-        for newdt in newdates:
-            tablename = 'stkmin_'+newdt
-            print(tablename)
-            ############### create table ##########################
-            createline = ['CREATE TABLE {0} '.format(tablename)+
-                          '({0} INT UNSIGNED NOT NULL'.format(TableCol.stkcd),
-                          '{0} INT UNSIGNED NOT NULL'.format(TableCol.time),
-                          '{0} FLOAT'.format(TableCol.open),
-                          '{0} FLOAT'.format(TableCol.high),
-                          '{0} FLOAT'.format(TableCol.low),
-                          '{0} FLOAT'.format(TableCol.close),
-                          '{0} DOUBLE'.format(TableCol.volume),
-                          '{0} DOUBLE'.format(TableCol.amount),
-                          '{0} INT UNSIGNED NOT NULL'.format(TableCol.stkid),
-                          'PRIMARY KEY ({0},{1})) '.format(TableCol.stkid,TableCol.time),
-                          ]
-            egn = 'ENGINE=InnoDB DEFAULT CHARSET=utf8'
-            try:
-                self.cursor.execute(','.join(createline)+egn)
-                self._logger.info('{0}create table {1} successfully in database {2}'.format(LogMark.info,tablename,self._currdb))
-            except mysql.connector.Error as e:
-                self._logger.error('{0}create table {1} failed in database {2},err : {3}'.format(LogMark.error,tablename,self._currdb,str(e)))
-                raise e
-            ################# load data ######################
-            newdata = h5py.File(os.path.join(self._updtpath,'{0}.mat'.format(newdt)))['sdata']
-            ################# insert data ######################
-            insertline = ','.join(['INSERT INTO {0} '.format(tablename)+
-                                   '({0}'.format(TableCol.stkcd),
-                                   '{0}'.format(TableCol.time),
-                                   '{0}'.format(TableCol.open),
-                                   '{0}'.format(TableCol.high),
-                                   '{0}'.format(TableCol.low),
-                                   '{0}'.format(TableCol.close),
-                                   '{0}'.format(TableCol.volume),
-                                   '{0}'.format(TableCol.amount),
-                                   '{0})'.format(TableCol.stkid)+
-                                   ' VALUES '])
-            try:
-                st = time.time()
-                for row in range(newdata.shape[1]):
-                    rowdata = newdata[:,row]
-                    exeline = ''.join([insertline,'({0},{1},{2},{3},{4},{5},{6},{7},{8})'.format(*rowdata)])
-                    self.cursor.execute(exeline)
-                self.conn.commit()
-                self._logger.info('{0}table updated {1} successfully in database {2} with {3} seconds'.format(LogMark.info,tablename,self._currdb,time.time()-st))
-            except mysql.connector.Error as e:
-                self.cursor.execute('DROP TABLE {0}'.format(tablename))
-                self._logger.info('{0}table {1} dropped from database {2}').format(LogMark.info,tablename,self._currdb)
-                self._logger.error('{0}update table {1} failed in database {2}, line No.{3} ,err : {4}'.format(LogMark.error,tablename,row,self._currdb,str(e)))
-                raise e
+    def _get_stklst(self,filepath,seed=0):
+        """专为并发更新by_stk数据库使用 """
+        total_lst = os.listdir(filepath)
+        select_lst = [val for ct,val in enumerate(total_lst,1) if ct%self._corutine_num==seed]
+        return select_lst
 
-    def update_data_by_stock(self,tempfolder):
+    def update_data_by_stock(self,tempfolder,seed=0):
         """ 按股票更新（历史）数据，目前为CSV格式"""
         self._db_connect(dbtype='by_stock')
         filepath = os.path.join(self._histpath,tempfolder)
-        filelst = os.listdir(filepath)
+        #filelst = os.listdir(filepath)
+        filelst = self._get_stklst(filepath=filepath,seed=seed)
+        print(filelst)
         colnames = ['date','time','open','high','low','close','volume','amount']
         colinfo = {
             TableCol.date:'INT UNSIGNED NOT NULL',
@@ -264,34 +206,36 @@ class StocksMinDB:
             TableCol.stkcd:'INT UNSIGNED NOT NULL'
         }
         prmkey = [TableCol.date,TableCol.time]
+        updtedlstpath = os.path.join(self._tmpupdt,'updtedlst{0}.txt'.format(seed))
+        os.system('cd.>{0}'.format(updtedlstpath))
         for fl in filelst:
             flname = fl.split('.')[0]
+            tablename = 'stkmin_' + flname.lower()
+            with open(updtedlstpath,'r') as tmpupdt:  # 处理中途失败的情况
+                updtedlst = tmpupdt.readlines()
+                updtedlst = [ufl.strip() for ufl in updtedlst]
+            if fl in updtedlst:
+                continue
             cond1 = not flname[2:].isnumeric()
             cond2 = flname[0:2]=='SH' and (flname[2] not in ('6'))
             cond3 = flname[0:2]=='SZ' and (flname[2] not in ('0','3'))
             cond4 = flname[0:2]=='SZ' and (flname[2:5]=='399')
             if cond1 or cond2 or cond3 or cond4:
                 continue
-            tablename = 'stkmin_' + flname.lower()
-            print(tablename)
             fldata = pd.read_csv(os.path.join(filepath,fl),names=colnames)
             fldata['stkcd'] = int(flname[2:8])
             fldata['date'] = fldata['date'].str.replace('/','').map(int)
             fldata['time'] = fldata['time'].str.replace(':','').map(int)
             self.update_db(data=fldata.values,tablename=tablename,colinfo=colinfo,prmkey=prmkey,dbtype='by_stock',if_exist='append')
+            with open(updtedlstpath,'a+') as tmpupdt:
+                tmpupdt.writelines(fl+'\n')
+        os.system('cd.>{0}'.format(updtedlstpath))
 
     def byday2bystk(self):
         if self._currdb=='by_day':
             self._switch_db(dbtype='by_stock')
 
-
     def bystk2byday(self):
         if self._currdb=='by_stock':
             self._switch_db(dbtype='by_day')
 
-
-
-if __name__=='__main__':
-    c = r'E:\stocks_data_min\StocksMinDB\configs'
-    obj = StocksMinDB(c)
-    obj.update_data_by_stock('200007-12')
